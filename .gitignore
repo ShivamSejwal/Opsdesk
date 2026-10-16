@@ -1,5 +1,9 @@
 node_modules/
 client/dist/
 server/data/tickets.json
+server/data/*.sqlite
+server/data/*.sqlite-shm
+server/data/*.sqlite-wal
+server/data/session.secret
 server/.env
 .DS_Store

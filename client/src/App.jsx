@@ -27,6 +27,8 @@ export default function App() {
   const [authConfigured, setAuthConfigured] = useState(false);
   const [authLoading, setAuthLoading] = useState(true);
   const [authError, setAuthError] = useState("");
+  const [authMode, setAuthMode] = useState("login");
+  const [authSubmitting, setAuthSubmitting] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const [copiedId, setCopiedId] = useState(false);
@@ -52,10 +54,27 @@ export default function App() {
     if (params.has("auth") || params.has("auth_error")) window.history.replaceState({}, "", window.location.pathname);
     fetch(`${API_ORIGIN}/api/auth/session`, { credentials: "include" })
       .then((response) => response.json())
-      .then((data) => { setAuthConfigured(data.configured); setUser(data.user); })
-      .catch(() => { setAuthConfigured(false); setUser({ id: "usr_demo_7f2a9c", name: "Jordan Davis", email: "jordan@studionorth.example", provider: "Demo workspace" }); })
+      .then((data) => { setAuthConfigured(data.googleConfigured); setUser(data.user); })
+      .catch(() => { setAuthConfigured(false); setUser(null); setAuthError("Could not connect to the OpsDesk server. Start the backend, then reload this page."); })
       .finally(() => setAuthLoading(false));
   }, []);
+
+  async function submitAuthentication(event) {
+    event.preventDefault();
+    setAuthSubmitting(true);
+    setAuthError("");
+    const formData = new FormData(event.currentTarget);
+    const body = Object.fromEntries(formData.entries());
+    try {
+      const response = await fetch(`${API_ORIGIN}/api/auth/${authMode === "register" ? "register" : "login"}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify(body)
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(Object.values(data.details || {})[0] || data.error || "Could not sign in.");
+      setUser(data.user);
+    } catch (requestError) { setAuthError(requestError.message); }
+    finally { setAuthSubmitting(false); }
+  }
 
   async function signOut() {
     try { await fetch(`${API_ORIGIN}/api/auth/logout`, { method: "POST", credentials: "include" }); }
@@ -80,6 +99,10 @@ export default function App() {
 
   // Ask the API for the visible slice whenever a search or filter changes.
   useEffect(() => {
+    if (!user) {
+      setLoading(false);
+      return;
+    }
     const controller = new AbortController();
     const timer = setTimeout(async () => {
       setLoading(true);
@@ -103,7 +126,7 @@ export default function App() {
       }
     }, query ? 250 : 0);
     return () => { clearTimeout(timer); controller.abort(); };
-  }, [query, statusFilter, priorityFilter, activeNav]);
+  }, [query, statusFilter, priorityFilter, activeNav, user?.id]);
 
   async function refreshTickets() {
     const params = new URLSearchParams();
@@ -167,7 +190,7 @@ export default function App() {
   }[activeNav] || [activeNav, "Your OpsDesk workspace."];
 
   if (authLoading) return <div className="auth-loading"><span className="spinner" /> Loading your workspace…</div>;
-  if (!user) return <main className="sign-in-screen"><section className="sign-in-card"><div className="brand sign-in-brand"><div className="brand-mark"><Command size={19} strokeWidth={2.6} /></div><span>opsdesk<span className="brand-period">.</span></span></div><div className="sign-in-emblem"><LifeBuoy size={22} /></div><div className="eyebrow">STUDIO NORTH WORKSPACE</div><h1>Welcome back</h1><p className="sign-in-description">Sign in to pick up where your support team left off.</p><button className="google-button" onClick={beginGoogleSignIn}><span className="google-g">G</span> Continue with Google</button>{authError && <div className="auth-message">{authError}</div>}{authConfigured ? <p className="sign-in-footnote">Sign in with the Google account connected to this workspace.</p> : <><p className="sign-in-footnote">Google OAuth is not configured for this local workspace yet.</p><button className="demo-button" onClick={async () => { try { const response = await fetch(`${API_ORIGIN}/api/auth/session`, { credentials: "include" }); const data = await response.json(); setUser(data.user); } catch { setUser({ id: "usr_demo_7f2a9c", name: "Jordan Davis", email: "jordan@studionorth.example", provider: "Demo workspace" }); } }}>Continue in demo mode</button></>}</section><span className="sign-in-copyright">OpsDesk · Support workspace</span></main>;
+  if (!user) return <main className="sign-in-screen"><section className="sign-in-card"><div className="brand sign-in-brand"><div className="brand-mark"><Command size={19} strokeWidth={2.6} /></div><span>opsdesk<span className="brand-period">.</span></span></div><div className="sign-in-emblem"><LifeBuoy size={22} /></div><div className="eyebrow">STUDIO NORTH WORKSPACE</div><h1>{authMode === "register" ? "Create your account" : "Welcome back"}</h1><p className="sign-in-description">{authMode === "register" ? "Set up your OpsDesk account to manage your support queue." : "Sign in to pick up where your support team left off."}</p><div className="auth-mode-switch"><button className={authMode === "login" ? "active" : ""} onClick={() => { setAuthMode("login"); setAuthError(""); }}>Sign in</button><button className={authMode === "register" ? "active" : ""} onClick={() => { setAuthMode("register"); setAuthError(""); }}>Create account</button></div><form className="auth-form" onSubmit={submitAuthentication}>{authMode === "register" && <label>Your name<input name="name" autoComplete="name" required maxLength="80" placeholder="Jordan Davis" /></label>}<label>Email address<input name="email" type="email" autoComplete="email" required maxLength="254" placeholder="you@company.com" /></label><label>Password<input name="password" type="password" autoComplete={authMode === "register" ? "new-password" : "current-password"} required minLength={authMode === "register" ? 10 : undefined} maxLength="128" placeholder={authMode === "register" ? "At least 10 characters" : "Enter your password"} /></label>{authError && <div className="auth-message">{authError}</div>}<button className="primary-button auth-submit" type="submit" disabled={authSubmitting}>{authSubmitting ? <><span className="button-spinner" /> Please wait…</> : authMode === "register" ? "Create account" : "Sign in"}</button></form><div className="auth-separator"><span />or<span /></div><button className="google-button" onClick={beginGoogleSignIn} disabled={!authConfigured}><span className="google-g">G</span> Continue with Google</button>{authConfigured ? <p className="sign-in-footnote">Google sign-in uses the workspace’s configured OAuth client.</p> : <p className="sign-in-footnote">Google sign-in is optional. Configure OAuth in <code>server/.env</code> to enable it.</p>}</section><span className="sign-in-copyright">OpsDesk · Support workspace</span></main>;
 
   return <div className="app-shell">
     <aside className="sidebar">
@@ -179,7 +202,7 @@ export default function App() {
       </nav>
       <div className="side-label tools-label">TOOLS</div>
       <nav className="main-nav">{[[Activity, "Activity"], [Settings2, "Settings"]].map(([Icon, label]) => <button key={label} className={`nav-item ${activeNav === label ? "selected" : ""}`} onClick={() => setActiveNav(label)}><Icon size={17} /><span>{label}</span></button>)}</nav>
-      <div className="sidebar-bottom"><div className="upgrade-card"><div className="upgrade-icon"><Sparkles size={16} /></div><strong>Make support<br />feel effortless.</strong><p>See what OpsDesk Pro can do for your team.</p><button onClick={() => setActiveNav("Plans")}>Explore Pro <ArrowUpRight size={14} /></button></div><button className={`help-link ${activeNav === "Help & resources" ? "selected" : ""}`} onClick={() => setActiveNav("Help & resources")}><CircleHelp size={16} /> Help & resources <ArrowUpRight size={13} /></button><div className="profile-menu-anchor"><button className="profile" aria-expanded={profileMenuOpen} onClick={() => { setProfileMenuOpen(!profileMenuOpen); setWorkspaceMenuOpen(false); }}><div className="profile-avatar">{initials(user.name)}</div><div className="profile-copy"><strong>{user.name}</strong><span>{user.provider === "Google" ? "Google account" : "Admin · Demo"}</span></div><ChevronDown size={15} /></button>{profileMenuOpen && <AccountPopover user={user} copied={copiedId} onCopy={copyPersonalId} onSignOut={signOut} />}</div></div>
+      <div className="sidebar-bottom"><div className="upgrade-card"><div className="upgrade-icon"><Sparkles size={16} /></div><strong>Make support<br />feel effortless.</strong><p>See what OpsDesk Pro can do for your team.</p><button onClick={() => setActiveNav("Plans")}>Explore Pro <ArrowUpRight size={14} /></button></div><button className={`help-link ${activeNav === "Help & resources" ? "selected" : ""}`} onClick={() => setActiveNav("Help & resources")}><CircleHelp size={16} /> Help & resources <ArrowUpRight size={13} /></button><div className="profile-menu-anchor"><button className="profile" aria-expanded={profileMenuOpen} onClick={() => { setProfileMenuOpen(!profileMenuOpen); setWorkspaceMenuOpen(false); }}><div className="profile-avatar">{initials(user.name)}</div><div className="profile-copy"><strong>{user.name}</strong><span>{user.provider === "Google" ? "Google account" : "Email account"}</span></div><ChevronDown size={15} /></button>{profileMenuOpen && <AccountPopover user={user} copied={copiedId} onCopy={copyPersonalId} onSignOut={signOut} />}</div></div>
     </aside>
 
     <main className="main-area">
@@ -304,5 +327,5 @@ function TicketRow({ ticket, onUpdate }) {
 function MoreDots() { return <span className="more-dots">•••</span>; }
 
 function AccountPopover({ user, copied, onCopy, onSignOut }) {
-  return <div className="account-popover"><div className="account-popover-head"><span className="profile-avatar">{initials(user.name)}</span><span><strong>{user.name}</strong><small>{user.email}</small></span></div><div className="personal-id-row"><span><small>PERSONAL ID</small><code>{user.id}</code></span><button aria-label="Copy personal ID" title="Copy personal ID" onClick={onCopy}>{copied ? <Check size={15} /> : <Copy size={15} />}</button></div><div className="provider-row"><span className="google-g small-g">G</span><span><strong>{user.provider === "Google" ? "Google account" : "Demo workspace"}</strong><small>{user.provider === "Google" ? "Connected with OAuth" : "Local demo sign-in"}</small></span></div><button className="sign-out-button" onClick={onSignOut}><LogOut size={15} /> Sign out</button></div>;
+  return <div className="account-popover"><div className="account-popover-head"><span className="profile-avatar">{initials(user.name)}</span><span><strong>{user.name}</strong><small>{user.email}</small></span></div><div className="personal-id-row"><span><small>PERSONAL ID</small><code>{user.id}</code></span><button aria-label="Copy personal ID" title="Copy personal ID" onClick={onCopy}>{copied ? <Check size={15} /> : <Copy size={15} />}</button></div><div className="provider-row"><span className="google-g small-g">{user.provider === "Google" ? "G" : "@"}</span><span><strong>{user.provider === "Google" ? "Google account" : "Email and password"}</strong><small>{user.provider === "Google" ? "Connected with OAuth" : "Local account"}</small></span></div><button className="sign-out-button" onClick={onSignOut}><LogOut size={15} /> Sign out</button></div>;
 }

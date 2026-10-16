@@ -1,8 +1,9 @@
 import express from "express";
 import cors from "cors";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { readTickets, saveTickets } from "./ticketStore.js";
+import { createHmac, pbkdf2, randomBytes, timingSafeEqual } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { promisify } from "node:util";
+import { createUser, findUserByEmail, findUserByProviderId, insertTicket, listTickets, publicUser, updateTicket } from "./database.js";
 
 loadLocalEnvironment();
 
@@ -11,9 +12,11 @@ const port = process.env.PORT || 3001;
 const frontendUrl = process.env.APP_URL || "http://localhost:5173";
 const cookieName = "opsdesk_session";
 const stateCookieName = "opsdesk_oauth_state";
-const demoUser = { id: "usr_demo_7f2a9c", name: "Jordan Davis", email: "jordan@studionorth.example", picture: null, provider: "Demo workspace" };
 const statuses = ["Open", "In Progress", "Resolved"];
 const priorities = ["Low", "Medium", "High"];
+const derivePasswordKey = promisify(pbkdf2);
+const passwordHashIterations = 600_000;
+const sessionSecret = getSessionSecret();
 
 function loadLocalEnvironment() {
   try {
@@ -30,6 +33,19 @@ function loadLocalEnvironment() {
     }
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
+  }
+}
+
+function getSessionSecret() {
+  if (process.env.OAUTH_SESSION_SECRET) return process.env.OAUTH_SESSION_SECRET;
+  const secretFile = new URL("../data/session.secret", import.meta.url);
+  try { return readFileSync(secretFile, "utf8").trim(); }
+  catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    const secret = randomBytes(32).toString("hex");
+    try { writeFileSync(secretFile, secret, { encoding: "utf8", mode: 0o600, flag: "wx" }); }
+    catch (writeError) { if (writeError.code !== "EEXIST") throw writeError; }
+    return readFileSync(secretFile, "utf8").trim();
   }
 }
 
@@ -52,15 +68,14 @@ function getCookie(request, name) {
 
 function signSession(payload) {
   const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
-  const signature = createHmac("sha256", process.env.OAUTH_SESSION_SECRET).update(encoded).digest("base64url");
+  const signature = createHmac("sha256", sessionSecret).update(encoded).digest("base64url");
   return `${encoded}.${signature}`;
 }
 
 function readSessionUser(request) {
-  if (!googleOAuthIsConfigured()) return null;
   const [encoded, signature] = getCookie(request, cookieName).split(".");
   if (!encoded || !signature) return null;
-  const expected = createHmac("sha256", process.env.OAUTH_SESSION_SECRET).update(encoded).digest();
+  const expected = createHmac("sha256", sessionSecret).update(encoded).digest();
   let actual;
   try { actual = Buffer.from(signature, "base64url"); } catch { return null; }
   if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
@@ -72,14 +87,69 @@ function readSessionUser(request) {
 }
 
 app.get("/api/auth/session", (request, response) => {
-  const configured = googleOAuthIsConfigured();
-  response.json({ configured, user: configured ? readSessionUser(request) : demoUser });
+  response.json({ googleConfigured: googleOAuthIsConfigured(), user: readSessionUser(request) });
 });
 
 app.post("/api/auth/logout", (request, response) => {
   response.clearCookie(cookieName, cookieOptions(0));
   response.json({ signedOut: true });
 });
+
+app.post("/api/auth/register", async (request, response, next) => {
+  try {
+    const { name, email, password } = request.body || {};
+    const errors = {};
+    if (typeof name !== "string" || !name.trim() || name.trim().length > 80) errors.name = "Enter your name (up to 80 characters).";
+    if (typeof email !== "string" || email.trim().length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) errors.email = "Enter a valid email address.";
+    if (typeof password !== "string" || password.length < 10 || password.length > 128) errors.password = "Choose a password between 10 and 128 characters.";
+    if (Object.keys(errors).length) return response.status(400).json({ error: "Please check your account details.", details: errors });
+
+    const normalizedEmail = email.trim().toLowerCase();
+    if (findUserByEmail(normalizedEmail)) return response.status(409).json({ error: "An account already uses that email. Sign in instead." });
+    const salt = randomBytes(16).toString("hex");
+    const derivedKey = await derivePasswordKey(password, salt, passwordHashIterations, 32, "sha256");
+    const user = createUser({
+      id: `usr_${randomBytes(8).toString("hex")}`,
+      name: name.trim(),
+      email: normalizedEmail,
+      passwordHash: `pbkdf2_sha256$${passwordHashIterations}$${salt}$${derivedKey.toString("hex")}`,
+      provider: "local",
+      createdAt: new Date().toISOString()
+    });
+    const safeUser = publicUser(user);
+    response.cookie(cookieName, signSession({ user: safeUser, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 }), cookieOptions(7 * 24 * 60 * 60 * 1000));
+    response.status(201).json({ user: safeUser });
+  } catch (error) {
+    if (error.code?.startsWith("SQLITE_CONSTRAINT")) return response.status(409).json({ error: "An account already uses that email. Sign in instead." });
+    next(error);
+  }
+});
+
+app.post("/api/auth/login", async (request, response, next) => {
+  try {
+    const { email, password } = request.body || {};
+    if (typeof email !== "string" || typeof password !== "string" || email.length > 254 || password.length > 128) {
+      return response.status(400).json({ error: "Enter your email and password." });
+    }
+    const user = findUserByEmail(email.trim().toLowerCase());
+    const validPassword = user?.provider === "local" && user.password_hash
+      ? await verifyPassword(password, user.password_hash)
+      : false;
+    if (!validPassword) return response.status(401).json({ error: "Email or password is incorrect." });
+    const safeUser = publicUser(user);
+    response.cookie(cookieName, signSession({ user: safeUser, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 }), cookieOptions(7 * 24 * 60 * 60 * 1000));
+    response.json({ user: safeUser });
+  } catch (error) { next(error); }
+});
+
+async function verifyPassword(password, storedHash) {
+  const [algorithm, iterationsText, salt, expectedHex] = storedHash.split("$");
+  const iterations = Number(iterationsText);
+  if (algorithm !== "pbkdf2_sha256" || iterations !== passwordHashIterations || !salt || !/^[a-f0-9]{64}$/i.test(expectedHex || "")) return false;
+  const actual = await derivePasswordKey(password, salt, iterations, 32, "sha256");
+  const expected = Buffer.from(expectedHex, "hex");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
 
 app.get("/api/auth/google", (request, response) => {
   if (!googleOAuthIsConfigured()) return response.redirect(`${frontendUrl}/?auth_error=google_not_configured`);
@@ -118,7 +188,12 @@ app.get("/api/auth/google/callback", async (request, response) => {
     const profile = await profileResponse.json();
     if (!profileResponse.ok || !profile.sub || !profile.email || profile.email_verified !== true) throw new Error("Google did not return a verified profile.");
 
-    const user = { id: `google_${profile.sub}`, name: profile.name || profile.email, email: profile.email, picture: profile.picture || null, provider: "Google" };
+    let account = findUserByProviderId(profile.sub);
+    if (!account) {
+      if (findUserByEmail(profile.email)) throw new Error("An account already exists for that email. Sign in with its original method.");
+      account = createUser({ id: `google_${profile.sub}`, name: profile.name || profile.email, email: profile.email.toLowerCase(), passwordHash: null, provider: "google", providerId: profile.sub, createdAt: new Date().toISOString() });
+    }
+    const user = publicUser(account);
     const session = signSession({ user, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 });
     response.cookie(cookieName, session, cookieOptions(7 * 24 * 60 * 60 * 1000));
     response.redirect(`${frontendUrl}/?auth=success`);
@@ -129,13 +204,13 @@ app.get("/api/auth/google/callback", async (request, response) => {
 });
 
 app.use("/api/tickets", (request, response, next) => {
-  if (!googleOAuthIsConfigured() || readSessionUser(request)) return next();
-  response.status(401).json({ error: "Sign in with Google to access this workspace." });
+  if (readSessionUser(request)) return next();
+  response.status(401).json({ error: "Please sign in to access this workspace." });
 });
 
 app.get("/api/tickets", async (request, response, next) => {
   try {
-    const tickets = await readTickets();
+    const tickets = listTickets();
     const summary = {
       total: tickets.length,
       open: tickets.filter((ticket) => ticket.status === "Open").length,
@@ -164,15 +239,14 @@ app.post("/api/tickets", async (request, response, next) => {
     if (!priorities.includes(priority)) errors.priority = "Choose Low, Medium, or High.";
     if (Object.keys(errors).length) return response.status(400).json({ error: "Please check the ticket details.", details: errors });
 
-    const tickets = await readTickets();
+    const tickets = listTickets();
     const highestNumber = tickets.reduce((highest, ticket) => Math.max(highest, Number(ticket.id.split("-")[1]) || 0), 1000);
     const ticket = {
       id: `OPS-${highestNumber + 1}`,
       title: title.trim(), description: description.trim(), requester: requester.trim(), email: email.trim(),
       status: "Open", priority, createdAt: new Date().toISOString()
     };
-    tickets.unshift(ticket);
-    await saveTickets(tickets);
+    insertTicket(ticket);
     response.status(201).json({ ticket });
   } catch (error) { next(error); }
 });
@@ -186,12 +260,9 @@ app.patch("/api/tickets/:id", async (request, response, next) => {
     if (priority !== undefined && !priorities.includes(priority)) errors.priority = "Choose Low, Medium, or High.";
     if (Object.keys(errors).length) return response.status(400).json({ error: "Invalid ticket update.", details: errors });
 
-    const tickets = await readTickets();
-    const index = tickets.findIndex((ticket) => ticket.id === request.params.id);
-    if (index === -1) return response.status(404).json({ error: "Ticket not found." });
-    tickets[index] = { ...tickets[index], ...(status ? { status } : {}), ...(priority ? { priority } : {}) };
-    await saveTickets(tickets);
-    response.json({ ticket: tickets[index] });
+    const ticket = updateTicket(request.params.id, { ...(status ? { status } : {}), ...(priority ? { priority } : {}) });
+    if (!ticket) return response.status(404).json({ error: "Ticket not found." });
+    response.json({ ticket });
   } catch (error) { next(error); }
 });
 
