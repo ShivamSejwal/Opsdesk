@@ -1,0 +1,5 @@
+node_modules/
+client/dist/
+server/data/tickets.json
+server/.env
+.DS_Store
