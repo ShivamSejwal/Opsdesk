@@ -3,6 +3,7 @@ import { Activity, ArrowDown, ArrowUpRight, Bell, BookOpen, Building2, Check, Ch
 
 const API_URL = "http://localhost:3001/api/tickets";
 const API_ORIGIN = "http://localhost:3001";
+const WORKSPACE_URL = `${API_ORIGIN}/api/workspaces`;
 const statuses = ["Open", "In Progress", "Resolved"];
 const priorities = ["Low", "Medium", "High"];
 const articles = [
@@ -32,6 +33,20 @@ export default function App() {
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const [copiedId, setCopiedId] = useState(false);
+  const [workspaces, setWorkspaces] = useState([]);
+  const [workspaceNotice, setWorkspaceNotice] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [workspaceInviteCode, setWorkspaceInviteCode] = useState("");
+  const [joiningWorkspace, setJoiningWorkspace] = useState(false);
+  const [workspaceModalOpen, setWorkspaceModalOpen] = useState(false);
+  const [createdWorkspace, setCreatedWorkspace] = useState(null);
+  const [creatingWorkspace, setCreatingWorkspace] = useState(false);
+  const [workspaceFormError, setWorkspaceFormError] = useState("");
+  const [notificationOpen, setNotificationOpen] = useState(false);
+  const [notificationLoading, setNotificationLoading] = useState(false);
+  const [notificationItems, setNotificationItems] = useState([]);
+  const [notificationError, setNotificationError] = useState("");
+  const [contactOpen, setContactOpen] = useState(false);
   const [tickets, setTickets] = useState([]);
   const [summary, setSummary] = useState({ total: 0, open: 0, inProgress: 0, resolved: 0 });
   const [query, setQuery] = useState("");
@@ -54,7 +69,7 @@ export default function App() {
     if (params.has("auth") || params.has("auth_error")) window.history.replaceState({}, "", window.location.pathname);
     fetch(`${API_ORIGIN}/api/auth/session`, { credentials: "include" })
       .then((response) => response.json())
-      .then((data) => { setAuthConfigured(data.googleConfigured); setUser(data.user); })
+      .then((data) => { setAuthConfigured(data.googleConfigured); setUser(data.user); setWorkspaces(data.workspaces || []); })
       .catch(() => { setAuthConfigured(false); setUser(null); setAuthError("Could not connect to the OpsDesk server. Start the backend, then reload this page."); })
       .finally(() => setAuthLoading(false));
   }, []);
@@ -72,6 +87,7 @@ export default function App() {
       const data = await response.json();
       if (!response.ok) throw new Error(Object.values(data.details || {})[0] || data.error || "Could not sign in.");
       setUser(data.user);
+      setWorkspaces(data.workspaces || []);
     } catch (requestError) { setAuthError(requestError.message); }
     finally { setAuthSubmitting(false); }
   }
@@ -80,6 +96,96 @@ export default function App() {
     try { await fetch(`${API_ORIGIN}/api/auth/logout`, { method: "POST", credentials: "include" }); }
     finally { setUser(null); setProfileMenuOpen(false); }
   }
+
+  async function toggleWorkspaceMenu() {
+    const shouldOpen = !workspaceMenuOpen;
+    setWorkspaceMenuOpen(shouldOpen);
+    setProfileMenuOpen(false);
+    setWorkspaceError("");
+    if (shouldOpen) {
+      try {
+        const response = await fetch(WORKSPACE_URL, { credentials: "include" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "Could not load workspaces.");
+        setWorkspaces(data.workspaces);
+      } catch (requestError) { setWorkspaceError(requestError.message); }
+    }
+  }
+
+  async function switchWorkspace(workspaceId) {
+    setWorkspaceError("");
+    try {
+      const response = await fetch(`${WORKSPACE_URL}/switch`, { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ workspaceId }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not switch workspaces.");
+      setUser(data.user);
+      setWorkspaceMenuOpen(false);
+      setNotificationItems([]);
+    } catch (requestError) { setWorkspaceError(requestError.message); }
+  }
+
+  async function joinWorkspace(event) {
+    event.preventDefault();
+    setJoiningWorkspace(true);
+    setWorkspaceError("");
+    try {
+      const response = await fetch(`${WORKSPACE_URL}/join`, { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ inviteCode: workspaceInviteCode }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not join that workspace.");
+      setUser(data.user);
+      setWorkspaces(data.workspaces);
+      setWorkspaceInviteCode("");
+      setWorkspaceMenuOpen(false);
+      setNotificationItems([]);
+    } catch (requestError) { setWorkspaceError(requestError.message); }
+    finally { setJoiningWorkspace(false); }
+  }
+
+  async function createWorkspace(event) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setCreatingWorkspace(true);
+    setWorkspaceFormError("");
+    try {
+      const response = await fetch(WORKSPACE_URL, { method: "POST", headers: { "Content-Type": "application/json" }, credentials: "include", body: JSON.stringify({ name: form.get("workspaceName") }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not create that workspace.");
+      setUser(data.user);
+      setWorkspaces(data.workspaces);
+      setCreatedWorkspace(data.workspace);
+      setWorkspaceModalOpen(false);
+      setWorkspaceMenuOpen(false);
+      setNotificationItems([]);
+    } catch (requestError) { setWorkspaceFormError(requestError.message); }
+    finally { setCreatingWorkspace(false); }
+  }
+
+  async function toggleNotifications() {
+    const shouldOpen = !notificationOpen;
+    setNotificationOpen(shouldOpen);
+    setProfileMenuOpen(false);
+    setWorkspaceMenuOpen(false);
+    if (!shouldOpen) return;
+    setNotificationLoading(true);
+    setNotificationError("");
+    try {
+      const response = await fetch(`${API_URL}?status=All`, { credentials: "include" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not load pending tickets.");
+      const rank = { High: 0, Medium: 1, Low: 2 };
+      const pending = data.tickets.filter((ticket) => ticket.status !== "Resolved");
+      pending.sort((a, b) => rank[a.priority] - rank[b.priority] || new Date(a.createdAt) - new Date(b.createdAt));
+      setNotificationItems(pending);
+    } catch (requestError) { setNotificationError(requestError.message); }
+    finally { setNotificationLoading(false); }
+  }
+
+  useEffect(() => {
+    if (!workspaceMenuOpen) return;
+    setWorkspaceNotice(true);
+    const timeout = setTimeout(() => setWorkspaceNotice(false), 5000);
+    return () => clearTimeout(timeout);
+  }, [workspaceMenuOpen]);
 
   async function copyPersonalId() {
     try {
@@ -126,7 +232,7 @@ export default function App() {
       }
     }, query ? 250 : 0);
     return () => { clearTimeout(timer); controller.abort(); };
-  }, [query, statusFilter, priorityFilter, activeNav, user?.id]);
+  }, [query, statusFilter, priorityFilter, activeNav, user?.id, user?.workspaceId]);
 
   async function refreshTickets() {
     const params = new URLSearchParams();
@@ -190,12 +296,12 @@ export default function App() {
   }[activeNav] || [activeNav, "Your OpsDesk workspace."];
 
   if (authLoading) return <div className="auth-loading"><span className="spinner" /> Loading your workspace…</div>;
-  if (!user) return <main className="sign-in-screen"><section className="sign-in-card"><div className="brand sign-in-brand"><div className="brand-mark"><Command size={19} strokeWidth={2.6} /></div><span>opsdesk<span className="brand-period">.</span></span></div><div className="sign-in-emblem"><LifeBuoy size={22} /></div><div className="eyebrow">STUDIO NORTH WORKSPACE</div><h1>{authMode === "register" ? "Create your account" : "Welcome back"}</h1><p className="sign-in-description">{authMode === "register" ? "Set up your OpsDesk account to manage your support queue." : "Sign in to pick up where your support team left off."}</p><div className="auth-mode-switch"><button className={authMode === "login" ? "active" : ""} onClick={() => { setAuthMode("login"); setAuthError(""); }}>Sign in</button><button className={authMode === "register" ? "active" : ""} onClick={() => { setAuthMode("register"); setAuthError(""); }}>Create account</button></div><form className="auth-form" onSubmit={submitAuthentication}>{authMode === "register" && <label>Your name<input name="name" autoComplete="name" required maxLength="80" placeholder="Jordan Davis" /></label>}<label>Email address<input name="email" type="email" autoComplete="email" required maxLength="254" placeholder="you@company.com" /></label><label>Password<input name="password" type="password" autoComplete={authMode === "register" ? "new-password" : "current-password"} required minLength={authMode === "register" ? 10 : undefined} maxLength="128" placeholder={authMode === "register" ? "At least 10 characters" : "Enter your password"} /></label>{authError && <div className="auth-message">{authError}</div>}<button className="primary-button auth-submit" type="submit" disabled={authSubmitting}>{authSubmitting ? <><span className="button-spinner" /> Please wait…</> : authMode === "register" ? "Create account" : "Sign in"}</button></form><div className="auth-separator"><span />or<span /></div><button className="google-button" onClick={beginGoogleSignIn} disabled={!authConfigured}><span className="google-g">G</span> Continue with Google</button>{authConfigured ? <p className="sign-in-footnote">Google sign-in uses the workspace’s configured OAuth client.</p> : <p className="sign-in-footnote">Google sign-in is optional. Configure OAuth in <code>server/.env</code> to enable it.</p>}</section><span className="sign-in-copyright">OpsDesk · Support workspace</span></main>;
+  if (!user) return <main className="sign-in-screen"><section className="sign-in-card"><div className="brand sign-in-brand"><div className="brand-mark"><Command size={19} strokeWidth={2.6} /></div><span>opsdesk<span className="brand-period">.</span></span></div><div className="sign-in-emblem"><LifeBuoy size={22} /></div><div className="eyebrow">STUDIO NORTH WORKSPACE</div><h1>{authMode === "register" ? "Create your account" : "Welcome back"}</h1><p className="sign-in-description">{authMode === "register" ? "Set up your OpsDesk account to manage your support queue." : "Sign in to pick up where your support team left off."}</p><div className="auth-mode-switch"><button className={authMode === "login" ? "active" : ""} onClick={() => { setAuthMode("login"); setAuthError(""); }}>Sign in</button><button className={authMode === "register" ? "active" : ""} onClick={() => { setAuthMode("register"); setAuthError(""); }}>Create account</button></div><form className="auth-form" onSubmit={submitAuthentication}>{authMode === "register" && <label>Your name<input name="name" autoComplete="name" required maxLength="80" placeholder="Jordan Davis" /></label>}<label>Email address<input name="email" type="email" autoComplete="email" required maxLength="254" placeholder="you@company.com" /></label><label>Password<input name="password" type="password" autoComplete={authMode === "register" ? "new-password" : "current-password"} required minLength={authMode === "register" ? 10 : undefined} maxLength="128" placeholder={authMode === "register" ? "At least 10 characters" : "Enter your password"} /></label><label>Organisation invite code <span className="optional-label">(optional)</span><input name="inviteCode" autoComplete="organization" placeholder="Blank joins Studio North" /></label><p className="auth-hint">Studio North is the default workplace. Enter another organisation’s invite code to join it.</p>{authError && <div className="auth-message">{authError}</div>}<button className="primary-button auth-submit" type="submit" disabled={authSubmitting}>{authSubmitting ? <><span className="button-spinner" /> Please wait…</> : authMode === "register" ? "Create account" : "Sign in"}</button></form><div className="auth-separator"><span />or<span /></div><button className="google-button" onClick={beginGoogleSignIn} disabled={!authConfigured}><span className="google-g">G</span> Continue with Google</button>{authConfigured ? <p className="sign-in-footnote">Google sign-in uses the workspace’s configured OAuth client.</p> : <p className="sign-in-footnote">Google sign-in is optional. Configure OAuth in <code>server/.env</code> to enable it.</p>}</section><span className="sign-in-copyright">OpsDesk · Support workspace</span></main>;
 
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><div className="brand-mark"><Command size={19} strokeWidth={2.6} /></div><span>opsdesk<span className="brand-period">.</span></span></div>
-      <div className="workspace-menu-anchor"><button className="workspace-card" aria-expanded={workspaceMenuOpen} onClick={() => { setWorkspaceMenuOpen(!workspaceMenuOpen); setProfileMenuOpen(false); }}><div className="workspace-avatar">S</div><div className="workspace-copy"><strong>Studio North</strong><span>Free workspace</span></div><ChevronDown size={15} /></button>{workspaceMenuOpen && <div className="workspace-popover"><span className="popover-label">CURRENT WORKSPACE</span><div className="workspace-option"><span className="workspace-avatar small">S</span><span><strong>Studio North</strong><small>Free plan · Active</small></span><Check size={15} /></div><div className="workspace-id"><span>Workspace ID</span><code>ws_studionorth_01</code></div><button className="popover-action" onClick={() => { setActiveNav("Settings"); setWorkspaceMenuOpen(false); }}>Manage workspace <ChevronRight size={14} /></button><div className="workspace-popover-note">This local MVP has one workspace.</div></div>}</div>
+      <div className="workspace-menu-anchor"><button className="workspace-card" aria-expanded={workspaceMenuOpen} onClick={toggleWorkspaceMenu}><div className="workspace-avatar">{initials(user.workspaceName || "Studio North")[0]}</div><div className="workspace-copy"><strong>{user.workspaceName || "Studio North"}</strong><span>{user.role === "superuser" ? "Superuser" : "Free workspace"}</span></div><ChevronDown size={15} /></button>{workspaceMenuOpen && <div className="workspace-popover"><span className="popover-label">YOUR WORKSPACES</span>{workspaces.map((workspace) => <button key={workspace.id} className="workspace-option selectable" onClick={() => switchWorkspace(workspace.id)}><span className="workspace-avatar small">{initials(workspace.name)[0]}</span><span><strong>{workspace.name}</strong><small>{workspace.id === user.workspaceId ? "Active workspace" : "Switch workspace"}</small></span>{workspace.id === user.workspaceId && <Check size={15} />}</button>)}<div className="workspace-id"><span>Workspace ID</span><code>{user.workspaceId}</code></div><button className="popover-action" onClick={() => { setActiveNav("Settings"); setWorkspaceMenuOpen(false); }}>Manage workspace <ChevronRight size={14} /></button>{workspaceNotice && <div className="workspace-popover-note">Studio North is the default workspace.</div>}<form className="workspace-join-form" onSubmit={joinWorkspace}><label>Join an organisation<input value={workspaceInviteCode} onChange={(event) => setWorkspaceInviteCode(event.target.value)} placeholder="Invite code" /></label><button className="secondary-button" disabled={joiningWorkspace}>{joiningWorkspace ? "Joining…" : "Join"}</button></form>{workspaceError && <div className="form-error">{workspaceError}</div>}{["admin", "superuser"].includes(user.role) && <button className="popover-action" onClick={() => { setWorkspaceModalOpen(true); setWorkspaceFormError(""); }}>Create a workplace <Plus size={14} /></button>}</div>}</div>
       <div className="side-label">WORKSPACE</div>
       <nav className="main-nav">
         {[ [LayoutDashboard, "Overview"], [LifeBuoy, "Tickets"], [Users, "Customers"], [FileText, "Knowledge base"] ].map(([Icon, label]) => <button key={label} className={`nav-item ${activeNav === label ? "selected" : ""}`} onClick={() => setActiveNav(label)}><Icon size={17} /><span>{label}</span>{label === "Tickets" && <span className="nav-count">{summary.open}</span>}</button>)}
@@ -206,7 +312,7 @@ export default function App() {
     </aside>
 
     <main className="main-area">
-      <header className="topbar"><div className="breadcrumbs"><span>Workspace</span><span className="crumb-slash">/</span><strong>{activeNav}</strong></div><div className="topbar-actions"><div className="status-live"><span /> All systems operational</div><button className="icon-button" aria-label="Notifications"><Bell size={18} /><i /></button><div className="top-divider" /><div className="profile-menu-anchor top-profile-anchor"><button className="top-avatar" aria-label="Open account menu" aria-expanded={profileMenuOpen} onClick={() => { setProfileMenuOpen(!profileMenuOpen); setWorkspaceMenuOpen(false); }}>{initials(user.name)}</button>{profileMenuOpen && <AccountPopover user={user} copied={copiedId} onCopy={copyPersonalId} onSignOut={signOut} />}</div></div></header>
+      <header className="topbar"><div className="breadcrumbs"><span>Workspace</span><span className="crumb-slash">/</span><strong>{activeNav}</strong></div><div className="topbar-actions"><div className="status-live"><span /> All systems operational</div><div className="notification-anchor"><button className="icon-button" aria-label="Notifications" aria-expanded={notificationOpen} onClick={toggleNotifications}><Bell size={18} />{notificationItems.length > 0 && <i />}</button>{notificationOpen && <div className="notification-popover"><div className="notification-heading"><span><strong>Needs attention</strong><small>{notificationItems.length} unresolved tickets</small></span><span className="notification-count">{notificationItems.filter((ticket) => ticket.priority === "High").length} high</span></div>{notificationLoading ? <div className="notification-empty">Loading pending tickets…</div> : notificationError ? <div className="notification-empty error-text">{notificationError}</div> : notificationItems.length ? notificationItems.map((ticket) => <button className="notification-item" key={ticket.id} onClick={() => { setNotificationOpen(false); setQuery(ticket.id); setActiveNav("Tickets"); }}><span className={`notification-priority ${ticket.priority.toLowerCase()}`} /><span><strong>{ticket.title}</strong><small>{ticket.priority} priority · {ticket.id} · {formatDate(ticket.createdAt)}</small></span></button>) : <div className="notification-empty">You’re all caught up.</div>}</div>}</div><div className="top-divider" /><div className="profile-menu-anchor top-profile-anchor"><button className="top-avatar" aria-label="Open account menu" aria-expanded={profileMenuOpen} onClick={() => { setProfileMenuOpen(!profileMenuOpen); setWorkspaceMenuOpen(false); setNotificationOpen(false); }}>{initials(user.name)}</button>{profileMenuOpen && <AccountPopover user={user} copied={copiedId} onCopy={copyPersonalId} onSignOut={signOut} />}</div></div></header>
       <div className="page-content">
         <div className="page-heading"><div><div className="eyebrow"><span className="eyebrow-dot" /> SUPPORT OPERATIONS</div><h1>{pageCopy[0]}{activeNav === "Overview" && <span className="wave"> ✳</span>}</h1><p>{pageCopy[1]}</p></div>{["Tickets", "Overview"].includes(activeNav) && <button className="primary-button" onClick={() => { setFormError(""); setModalOpen(true); }}><Plus size={17} strokeWidth={2.5} /> New ticket</button>}</div>
 
@@ -227,11 +333,14 @@ export default function App() {
         {!loading && !error && activeNav === "Activity" && <ActivityPage tickets={tickets} />}
         {!loading && !error && activeNav === "Settings" && <SettingsPage saved={settingsSaved} onSave={(values) => { localStorage.setItem("opsdesk-settings", JSON.stringify(values)); setSettingsSaved(true); setTimeout(() => setSettingsSaved(false), 2500); }} />}
         {!loading && !error && activeNav === "Help & resources" && <HelpPage onOpenKnowledge={() => setActiveNav("Knowledge base")} />}
-        {!loading && !error && activeNav === "Plans" && <PlansPage onOpenSettings={() => setActiveNav("Settings")} />}
+        {!loading && !error && activeNav === "Plans" && <PlansPage onOpenSettings={() => setActiveNav("Settings")} onContact={() => setContactOpen(true)} />}
         <footer className="page-footer"><span>© 2026 OpsDesk, Inc.</span><div><span><i className="footer-dot" /> API connected</span><a href="http://localhost:3001/api/tickets" target="_blank" rel="noreferrer">API docs <ArrowUpRight size={12} /></a><button className="footer-link" onClick={() => setActiveNav("Help & resources")}>Help center</button></div></footer>
       </div>
     </main>
 
+    {workspaceModalOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setWorkspaceModalOpen(false); }}><section className="ticket-modal" role="dialog" aria-modal="true" aria-labelledby="workspace-modal-title"><div className="modal-heading"><div><div className="eyebrow">ADMIN WORKSPACE SETUP</div><h2 id="workspace-modal-title">Create a workplace</h2><p>A separate support workspace will be created and selected.</p></div><button className="modal-close" onClick={() => setWorkspaceModalOpen(false)} aria-label="Close dialog"><X size={19} /></button></div><form onSubmit={createWorkspace}><label>Workplace name<input name="workspaceName" required minLength="2" maxLength="60" placeholder="e.g. Northwind Support" /></label>{workspaceFormError && <div className="form-error">{workspaceFormError}</div>}<div className="modal-actions"><button className="cancel-button" type="button" onClick={() => setWorkspaceModalOpen(false)}>Cancel</button><button className="primary-button" type="submit" disabled={creatingWorkspace}>{creatingWorkspace ? "Creating…" : "Create workplace"}</button></div></form></section></div>}
+    {createdWorkspace && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setCreatedWorkspace(null); }}><section className="ticket-modal" role="dialog" aria-modal="true" aria-labelledby="created-workspace-title"><div className="modal-heading"><div><div className="eyebrow">WORKSPACE CREATED</div><h2 id="created-workspace-title">{createdWorkspace.name}</h2><p>Share this invite code with people who should join this workplace.</p></div><button className="modal-close" onClick={() => setCreatedWorkspace(null)} aria-label="Close dialog"><X size={19} /></button></div><div className="created-invite-code">{createdWorkspace.inviteCode}</div><div className="modal-actions"><button className="primary-button" onClick={() => setCreatedWorkspace(null)}>Done</button></div></section></div>}
+    {contactOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setContactOpen(false); }}><section className="ticket-modal" role="dialog" aria-modal="true" aria-labelledby="contact-modal-title"><div className="modal-heading"><div><div className="eyebrow">OPS DESK PRO</div><h2 id="contact-modal-title">Talk to our team</h2><p>Tell us a little about your team and we’ll follow up.</p></div><button className="modal-close" onClick={() => setContactOpen(false)} aria-label="Close dialog"><X size={19} /></button></div><form onSubmit={(event) => { event.preventDefault(); const values = new FormData(event.currentTarget); const subject = encodeURIComponent(`OpsDesk Pro enquiry from ${values.get("contactName")}`); const body = encodeURIComponent(`Name: ${values.get("contactName")}\nEmail: ${values.get("contactEmail")}\nOrganisation: ${values.get("organisation")}\nTeam size: ${values.get("teamSize")}\n\n${values.get("message")}`); window.location.href = `mailto:Sales@opsdesk.com?subject=${subject}&body=${body}`; setContactOpen(false); }}><div className="form-row"><label>Your name<input name="contactName" required maxLength="80" defaultValue={user.name} /></label><label>Work email<input name="contactEmail" type="email" required maxLength="254" defaultValue={user.email} /></label></div><label>Organisation<input name="organisation" required maxLength="100" defaultValue={user.workspaceName} /></label><label>Team size<select name="teamSize" defaultValue="2–10"><option>1</option><option>2–10</option><option>11–50</option><option>51–200</option><option>201+</option></select></label><label>What would help your team?<textarea name="message" rows="3" maxLength="1000" placeholder="Share your needs or questions…" /></label><p className="auth-hint">This opens your email app addressed to Sales@opsdesk.com.</p><div className="modal-actions"><button className="cancel-button" type="button" onClick={() => setContactOpen(false)}>Cancel</button><button className="primary-button" type="submit"><Mail size={15} /> Contact sales</button></div></form></section></div>}
     {selectedArticle && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelectedArticle(null); }}><section className="ticket-modal article-modal" role="dialog" aria-modal="true" aria-labelledby="article-title"><div className="modal-heading"><div><div className="eyebrow">{selectedArticle.category.toUpperCase()} · {selectedArticle.read.toUpperCase()}</div><h2 id="article-title">{selectedArticle.title}</h2><p>{selectedArticle.summary}</p></div><button className="modal-close" onClick={() => setSelectedArticle(null)} aria-label="Close article"><X size={19} /></button></div><div className="article-body"><p>{selectedArticle.summary} This guide is part of your OpsDesk starter library.</p><h3>Recommended steps</h3><ol><li>Start with the details provided in the request.</li><li>Confirm the requester and any relevant account information.</li><li>Update the ticket status as work progresses so your team can follow along.</li></ol><p>If you still need help, contact your workspace administrator or create a support ticket.</p></div><div className="modal-actions"><button className="primary-button" onClick={() => setSelectedArticle(null)}>Done</button></div></section></div>}
     {modalOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setModalOpen(false); }}><section className="ticket-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><div className="modal-heading"><div><div className="eyebrow">SUPPORT REQUEST</div><h2 id="modal-title">Create a ticket</h2><p>Add a request to your support queue.</p></div><button className="modal-close" onClick={() => setModalOpen(false)} aria-label="Close dialog"><X size={19} /></button></div><form onSubmit={createTicket}><label>Ticket title<input name="title" required maxLength="120" placeholder="e.g. Can't access shared drive" /></label><label>Description<textarea name="description" required maxLength="1000" rows="4" placeholder="Tell us a little more about the issue..." /></label><div className="form-row"><label>Requester<input name="requester" required maxLength="80" placeholder="Full name" /></label><label>Email<input name="email" type="email" required placeholder="name@company.com" /></label></div><label>Priority<select name="priority" defaultValue="Medium">{priorities.map((priority) => <option key={priority}>{priority}</option>)}</select></label>{formError && <div className="form-error">{formError}</div>}<div className="modal-actions"><button className="cancel-button" type="button" onClick={() => setModalOpen(false)}>Cancel</button><button className="primary-button" type="submit" disabled={saving}>{saving ? <><span className="button-spinner" /> Creating…</> : <><Plus size={16} /> Create ticket</>}</button></div></form></section></div>}
   </div>;
@@ -308,8 +417,8 @@ function HelpPage({ onOpenKnowledge }) {
   return <div className="help-grid"><section className="content-card help-card"><span className="help-card-icon"><BookOpen size={20} /></span><h2>Browse the knowledge base</h2><p>Step-by-step guides for tickets, customer requests, and workspace basics.</p><button className="secondary-button" onClick={onOpenKnowledge}>Explore articles <ArrowUpRight size={14} /></button></section><section className="content-card help-card"><span className="help-card-icon"><Mail size={20} /></span><h2>Talk to our team</h2><p>Need a hand with OpsDesk? Send a note and we’ll help you get sorted.</p><a className="secondary-button" href="mailto:help@opsdesk.example">Email support <ArrowUpRight size={14} /></a></section><section className="content-card help-card"><span className="help-card-icon"><LifeBuoy size={20} /></span><h2>Ticket workflow guide</h2><p>Learn how your team can use statuses and priorities to keep work moving.</p><button className="secondary-button" onClick={onOpenKnowledge}>See ticket guides <ArrowUpRight size={14} /></button></section></div>;
 }
 
-function PlansPage({ onOpenSettings }) {
-  return <section className="plan-card"><span className="plan-sparkle"><Sparkles size={21} /></span><span className="eyebrow">OPS DESK PRO</span><h2>Support that grows<br />with your team.</h2><p>This MVP workspace is ready for your first support queue. Keep using the core ticket tools while you explore what a larger team could need.</p><div className="plan-features"><span><CheckCircle2 size={16} /> Shared ticket workspace</span><span><CheckCircle2 size={16} /> Customer directory</span><span><CheckCircle2 size={16} /> Team preferences</span></div><button className="primary-button" onClick={onOpenSettings}>Review workspace settings <ChevronRight size={15} /></button><small>Plan information is a preview for this local demo.</small></section>;
+function PlansPage({ onOpenSettings, onContact }) {
+  return <section className="plan-card"><span className="plan-sparkle"><Sparkles size={21} /></span><span className="eyebrow">OPS DESK PRO</span><h2>Support that grows<br />with your team.</h2><p>This MVP workspace is ready for your first support queue. Keep using the core ticket tools while you explore what a larger team could need.</p><div className="plan-features"><span><CheckCircle2 size={16} /> Shared ticket workspace</span><span><CheckCircle2 size={16} /> Customer directory</span><span><CheckCircle2 size={16} /> Team preferences</span></div><div className="plan-actions"><button className="primary-button" onClick={onOpenSettings}>Review workspace settings <ChevronRight size={15} /></button><button className="secondary-button" onClick={onContact}><Mail size={15} /> Contact about Pro</button></div><small>Plan information is a preview for this local demo.</small></section>;
 }
 
 function StatusBadge({ status }) {

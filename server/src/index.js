@@ -3,7 +3,7 @@ import cors from "cors";
 import { createHmac, pbkdf2, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { promisify } from "node:util";
-import { createUser, findUserByEmail, findUserByProviderId, insertTicket, listTickets, publicUser, updateTicket } from "./database.js";
+import { addUserToWorkspace, createUser, createWorkspaceForUser, findUserByEmail, findUserById, findUserByProviderId, getDefaultWorkspace, getHighestTicketNumber, getUserInWorkspace, getWorkspaceByInviteCode, insertTicket, listTickets, listWorkspacesForUser, publicUser, updateTicket } from "./database.js";
 
 loadLocalEnvironment();
 
@@ -86,8 +86,36 @@ function readSessionUser(request) {
   } catch { return null; }
 }
 
+function currentUser(request) {
+  const sessionUser = readSessionUser(request);
+  return sessionUser ? publicUser(findUserById(sessionUser.id), sessionUser.workspaceId) : null;
+}
+
+function setUserSession(response, user) {
+  const maxAge = 7 * 24 * 60 * 60 * 1000;
+  response.cookie(cookieName, signSession({ user, expiresAt: Date.now() + maxAge }), cookieOptions(maxAge));
+}
+
+function visibleWorkspaces(user) {
+  if (!user) return [];
+  return listWorkspacesForUser(user.id).map((workspace) => {
+    const { accountRole, ...details } = workspace;
+    if (user.role === "admin" || user.role === "superuser") return details;
+    const { inviteCode, ...memberDetails } = details;
+    return memberDetails;
+  });
+}
+
+function requireSignedIn(request, response, next) {
+  const user = currentUser(request);
+  if (!user) return response.status(401).json({ error: "Please sign in to access this workspace." });
+  request.user = user;
+  next();
+}
+
 app.get("/api/auth/session", (request, response) => {
-  response.json({ googleConfigured: googleOAuthIsConfigured(), user: readSessionUser(request) });
+  const user = currentUser(request);
+  response.json({ googleConfigured: googleOAuthIsConfigured(), user, workspaces: visibleWorkspaces(user) });
 });
 
 app.post("/api/auth/logout", (request, response) => {
@@ -97,15 +125,18 @@ app.post("/api/auth/logout", (request, response) => {
 
 app.post("/api/auth/register", async (request, response, next) => {
   try {
-    const { name, email, password } = request.body || {};
+    const { name, email, password, inviteCode } = request.body || {};
     const errors = {};
     if (typeof name !== "string" || !name.trim() || name.trim().length > 80) errors.name = "Enter your name (up to 80 characters).";
     if (typeof email !== "string" || email.trim().length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) errors.email = "Enter a valid email address.";
     if (typeof password !== "string" || password.length < 10 || password.length > 128) errors.password = "Choose a password between 10 and 128 characters.";
+    if (inviteCode !== undefined && typeof inviteCode !== "string") errors.inviteCode = "Enter a valid organisation invite code.";
     if (Object.keys(errors).length) return response.status(400).json({ error: "Please check your account details.", details: errors });
 
     const normalizedEmail = email.trim().toLowerCase();
     if (findUserByEmail(normalizedEmail)) return response.status(409).json({ error: "An account already uses that email. Sign in instead." });
+    const workspace = inviteCode?.trim() ? getWorkspaceByInviteCode(inviteCode.trim()) : getDefaultWorkspace();
+    if (!workspace) return response.status(400).json({ error: "That organisation invite code was not found." });
     const salt = randomBytes(16).toString("hex");
     const derivedKey = await derivePasswordKey(password, salt, passwordHashIterations, 32, "sha256");
     const user = createUser({
@@ -116,9 +147,10 @@ app.post("/api/auth/register", async (request, response, next) => {
       provider: "local",
       createdAt: new Date().toISOString()
     });
-    const safeUser = publicUser(user);
-    response.cookie(cookieName, signSession({ user: safeUser, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 }), cookieOptions(7 * 24 * 60 * 60 * 1000));
-    response.status(201).json({ user: safeUser });
+    addUserToWorkspace(user.id, workspace.id);
+    const safeUser = publicUser(user, workspace.id);
+    setUserSession(response, safeUser);
+    response.status(201).json({ user: safeUser, workspaces: visibleWorkspaces(safeUser) });
   } catch (error) {
     if (error.code?.startsWith("SQLITE_CONSTRAINT")) return response.status(409).json({ error: "An account already uses that email. Sign in instead." });
     next(error);
@@ -127,18 +159,28 @@ app.post("/api/auth/register", async (request, response, next) => {
 
 app.post("/api/auth/login", async (request, response, next) => {
   try {
-    const { email, password } = request.body || {};
+    const { email, password, inviteCode } = request.body || {};
     if (typeof email !== "string" || typeof password !== "string" || email.length > 254 || password.length > 128) {
       return response.status(400).json({ error: "Enter your email and password." });
     }
+    if (inviteCode !== undefined && typeof inviteCode !== "string") return response.status(400).json({ error: "Enter a valid organisation invite code." });
     const user = findUserByEmail(email.trim().toLowerCase());
     const validPassword = user?.provider === "local" && user.password_hash
       ? await verifyPassword(password, user.password_hash)
       : false;
     if (!validPassword) return response.status(401).json({ error: "Email or password is incorrect." });
-    const safeUser = publicUser(user);
-    response.cookie(cookieName, signSession({ user: safeUser, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 }), cookieOptions(7 * 24 * 60 * 60 * 1000));
-    response.json({ user: safeUser });
+    let workspace;
+    if (inviteCode?.trim()) {
+      workspace = getWorkspaceByInviteCode(inviteCode.trim());
+      if (!workspace) return response.status(400).json({ error: "That organisation invite code was not found." });
+      addUserToWorkspace(user.id, workspace.id);
+    } else {
+      workspace = listWorkspacesForUser(user.id)[0] || getDefaultWorkspace();
+      addUserToWorkspace(user.id, workspace.id);
+    }
+    const safeUser = publicUser(user, workspace.id);
+    setUserSession(response, safeUser);
+    response.json({ user: safeUser, workspaces: visibleWorkspaces(safeUser) });
   } catch (error) { next(error); }
 });
 
@@ -193,9 +235,10 @@ app.get("/api/auth/google/callback", async (request, response) => {
       if (findUserByEmail(profile.email)) throw new Error("An account already exists for that email. Sign in with its original method.");
       account = createUser({ id: `google_${profile.sub}`, name: profile.name || profile.email, email: profile.email.toLowerCase(), passwordHash: null, provider: "google", providerId: profile.sub, createdAt: new Date().toISOString() });
     }
-    const user = publicUser(account);
-    const session = signSession({ user, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 });
-    response.cookie(cookieName, session, cookieOptions(7 * 24 * 60 * 60 * 1000));
+    const defaultWorkspace = getDefaultWorkspace();
+    addUserToWorkspace(account.id, defaultWorkspace.id);
+    const user = publicUser(account, defaultWorkspace.id);
+    setUserSession(response, user);
     response.redirect(`${frontendUrl}/?auth=success`);
   } catch (error) {
     console.error("Google sign-in failed:", error.message);
@@ -203,14 +246,48 @@ app.get("/api/auth/google/callback", async (request, response) => {
   }
 });
 
-app.use("/api/tickets", (request, response, next) => {
-  if (readSessionUser(request)) return next();
-  response.status(401).json({ error: "Please sign in to access this workspace." });
+app.use("/api/workspaces", requireSignedIn);
+app.get("/api/workspaces", (request, response) => response.json({ workspaces: visibleWorkspaces(request.user) }));
+
+app.post("/api/workspaces", (request, response, next) => {
+  try {
+    if (!["admin", "superuser"].includes(request.user.role)) return response.status(403).json({ error: "Only an admin or superuser can create a workspace." });
+    const { name } = request.body || {};
+    if (typeof name !== "string" || name.trim().length < 2 || name.trim().length > 60) return response.status(400).json({ error: "Enter a workspace name between 2 and 60 characters." });
+    const workspace = createWorkspaceForUser(request.user, name);
+    const user = publicUser(findUserById(request.user.id), workspace.id);
+    setUserSession(response, user);
+    response.status(201).json({ workspace, user, workspaces: visibleWorkspaces(user) });
+  } catch (error) {
+    if (error.message.includes("UNIQUE constraint failed: workspaces.name")) return response.status(409).json({ error: "A workspace with that name already exists." });
+    next(error);
+  }
 });
+
+app.post("/api/workspaces/join", (request, response) => {
+  const { inviteCode } = request.body || {};
+  if (typeof inviteCode !== "string" || !inviteCode.trim()) return response.status(400).json({ error: "Enter an organisation invite code." });
+  const workspace = getWorkspaceByInviteCode(inviteCode.trim());
+  if (!workspace) return response.status(404).json({ error: "That organisation invite code was not found." });
+  addUserToWorkspace(request.user.id, workspace.id);
+  const user = publicUser(findUserById(request.user.id), workspace.id);
+  setUserSession(response, user);
+  response.json({ user, workspaces: visibleWorkspaces(user), joined: workspace.name });
+});
+
+app.post("/api/workspaces/switch", (request, response) => {
+  const { workspaceId } = request.body || {};
+  const user = typeof workspaceId === "string" ? publicUser(findUserById(request.user.id), workspaceId) : null;
+  if (!user) return response.status(404).json({ error: "That workspace is not available to this account." });
+  setUserSession(response, user);
+  response.json({ user });
+});
+
+app.use("/api/tickets", requireSignedIn);
 
 app.get("/api/tickets", async (request, response, next) => {
   try {
-    const tickets = listTickets();
+    const tickets = listTickets(request.user.workspaceId);
     const summary = {
       total: tickets.length,
       open: tickets.filter((ticket) => ticket.status === "Open").length,
@@ -239,14 +316,12 @@ app.post("/api/tickets", async (request, response, next) => {
     if (!priorities.includes(priority)) errors.priority = "Choose Low, Medium, or High.";
     if (Object.keys(errors).length) return response.status(400).json({ error: "Please check the ticket details.", details: errors });
 
-    const tickets = listTickets();
-    const highestNumber = tickets.reduce((highest, ticket) => Math.max(highest, Number(ticket.id.split("-")[1]) || 0), 1000);
     const ticket = {
-      id: `OPS-${highestNumber + 1}`,
+      id: `OPS-${getHighestTicketNumber() + 1}`,
       title: title.trim(), description: description.trim(), requester: requester.trim(), email: email.trim(),
       status: "Open", priority, createdAt: new Date().toISOString()
     };
-    insertTicket(ticket);
+    insertTicket(ticket, request.user.workspaceId);
     response.status(201).json({ ticket });
   } catch (error) { next(error); }
 });
@@ -260,7 +335,7 @@ app.patch("/api/tickets/:id", async (request, response, next) => {
     if (priority !== undefined && !priorities.includes(priority)) errors.priority = "Choose Low, Medium, or High.";
     if (Object.keys(errors).length) return response.status(400).json({ error: "Invalid ticket update.", details: errors });
 
-    const ticket = updateTicket(request.params.id, { ...(status ? { status } : {}), ...(priority ? { priority } : {}) });
+    const ticket = updateTicket(request.params.id, request.user.workspaceId, { ...(status ? { status } : {}), ...(priority ? { priority } : {}) });
     if (!ticket) return response.status(404).json({ error: "Ticket not found." });
     response.json({ ticket });
   } catch (error) { next(error); }
