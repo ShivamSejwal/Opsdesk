@@ -19,11 +19,7 @@ On first start, OpsDesk creates `server/data/opsdesk.sqlite` and adds the Studio
 
 ## Sign in and workspaces
 
-Use this account to explore the app:
 
-| Email | Password |
-| --- | --- |
-| `shiv@gmail.com` | `12345` |
 
 This is a local demo account. Change the password before using the app in any shared or hosted environment. New accounts require a password of at least 10 characters; passwords are stored as salted PBKDF2-SHA-256 hashes.
 
